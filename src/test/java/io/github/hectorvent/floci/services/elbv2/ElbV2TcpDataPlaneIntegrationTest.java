@@ -42,6 +42,8 @@ import javax.net.ssl.SSLSocket;
 import javax.net.ssl.TrustManagerFactory;
 
 import java.io.IOException;
+import java.net.BindException;
+import java.net.ConnectException;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
@@ -54,6 +56,7 @@ import java.util.Set;
 import java.util.concurrent.TimeUnit;
 
 import static org.awaitility.Awaitility.await;
+import static org.junit.jupiter.api.Assertions.assertAll;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -127,7 +130,7 @@ class ElbV2TcpDataPlaneIntegrationTest {
                 .defaultActions(Action.builder().type(ActionTypeEnum.FORWARD)
                         .targetGroupArn(targetGroupArn).build()))
                 .listeners().getFirst().listenerArn();
-        await().atMost(Duration.ofSeconds(5)).untilAsserted(() -> {
+        await().atMost(Duration.ofSeconds(5)).ignoreException(ConnectException.class).untilAsserted(() -> {
             try (Socket socket = connect(listenerPort)) {
                 assertEquals(listenerPort, socket.getPort());
             }
@@ -135,26 +138,38 @@ class ElbV2TcpDataPlaneIntegrationTest {
     }
 
     @AfterEach
-    void cleanup() throws Exception {
-        if (client != null) {
-            try (ElasticLoadBalancingV2Client closeable = client) {
-                if (listenerArn != null) {
-                    closeable.deleteListener(request -> request.listenerArn(listenerArn));
-                }
-                if (loadBalancerArn != null) {
-                    closeable.deleteLoadBalancer(request -> request.loadBalancerArn(loadBalancerArn));
-                }
-                if (targetGroupArn != null) {
-                    closeable.deleteTargetGroup(request -> request.targetGroupArn(targetGroupArn));
-                }
-            }
-        }
-        if (backend != null) {
-            backend.close().toCompletionStage().toCompletableFuture().get(5, TimeUnit.SECONDS);
-        }
-        if (healthBackend != null) {
-            healthBackend.close().toCompletionStage().toCompletableFuture().get(5, TimeUnit.SECONDS);
-        }
+    void cleanup() {
+        assertAll("Clean up every TCP fixture resource even if another cleanup fails",
+                () -> {
+                    if (client != null && listenerArn != null) {
+                        client.deleteListener(request -> request.listenerArn(listenerArn));
+                    }
+                },
+                () -> {
+                    if (client != null && loadBalancerArn != null) {
+                        client.deleteLoadBalancer(request -> request.loadBalancerArn(loadBalancerArn));
+                    }
+                },
+                () -> {
+                    if (client != null && targetGroupArn != null) {
+                        client.deleteTargetGroup(request -> request.targetGroupArn(targetGroupArn));
+                    }
+                },
+                () -> {
+                    if (backend != null) {
+                        backend.close().toCompletionStage().toCompletableFuture().get(5, TimeUnit.SECONDS);
+                    }
+                },
+                () -> {
+                    if (healthBackend != null) {
+                        healthBackend.close().toCompletionStage().toCompletableFuture().get(5, TimeUnit.SECONDS);
+                    }
+                },
+                () -> {
+                    if (client != null) {
+                        client.close();
+                    }
+                });
     }
 
     @Test
@@ -238,27 +253,19 @@ class ElbV2TcpDataPlaneIntegrationTest {
             listenerPort = reservation.getLocalPort();
         }
         client.modifyListener(request -> request.listenerArn(listenerArn).port(listenerPort));
-        await().atMost(Duration.ofSeconds(5)).untilAsserted(() -> {
+        await().atMost(Duration.ofSeconds(5)).ignoreException(ConnectException.class).untilAsserted(() -> {
             try (Socket socket = connect(listenerPort)) {
                 assertEcho(socket, new byte[]{0, 7, (byte) 0xff});
             }
         });
-        await().atMost(Duration.ofSeconds(5)).untilAsserted(() -> assertThrows(IOException.class, () -> {
-            try (Socket socket = connect(oldPort)) {
-                assertEquals(oldPort, socket.getPort());
-            }
-        }));
+        assertPortReleased(oldPort);
     }
 
     @Test
     void deletingTcpListenerReleasesItsPort() {
         client.deleteListener(request -> request.listenerArn(listenerArn));
         listenerArn = null;
-        await().atMost(Duration.ofSeconds(5)).untilAsserted(() -> assertThrows(IOException.class, () -> {
-            try (Socket socket = connect(listenerPort)) {
-                assertEquals(listenerPort, socket.getPort());
-            }
-        }));
+        assertPortReleased(listenerPort);
     }
 
     @ParameterizedTest
@@ -316,9 +323,10 @@ class ElbV2TcpDataPlaneIntegrationTest {
             }
             assertEquals(Set.of(42, 43), replies);
         } finally {
-            client.deregisterTargets(request -> request.targetGroupArn(targetGroupArn).targets(TargetDescription.builder()
-                    .id("127.0.0.1").port(second.actualPort()).build()));
-            second.close().toCompletionStage().toCompletableFuture().get(5, TimeUnit.SECONDS);
+            assertAll("Deregister and close the second TCP target",
+                    () -> client.deregisterTargets(request -> request.targetGroupArn(targetGroupArn)
+                            .targets(TargetDescription.builder().id("127.0.0.1").port(second.actualPort()).build())),
+                    () -> second.close().toCompletionStage().toCompletableFuture().get(5, TimeUnit.SECONDS));
         }
     }
 
@@ -338,9 +346,10 @@ class ElbV2TcpDataPlaneIntegrationTest {
                 assertEcho(established, new byte[]{3, 4, 5});
             }
         } finally {
-            client.modifyListener(request -> request.listenerArn(listenerArn).defaultActions(Action.builder()
-                    .type(ActionTypeEnum.FORWARD).targetGroupArn(targetGroupArn).build()));
-            client.deleteTargetGroup(request -> request.targetGroupArn(emptyTgArn));
+            assertAll("Restore the listener and delete the temporary target group",
+                    () -> client.modifyListener(request -> request.listenerArn(listenerArn).defaultActions(Action.builder()
+                            .type(ActionTypeEnum.FORWARD).targetGroupArn(targetGroupArn).build())),
+                    () -> client.deleteTargetGroup(request -> request.targetGroupArn(emptyTgArn)));
         }
     }
 
@@ -353,9 +362,33 @@ class ElbV2TcpDataPlaneIntegrationTest {
 
     private static Socket connect(int port) throws IOException {
         Socket socket = new Socket();
-        socket.connect(new InetSocketAddress("127.0.0.1", port), 2000);
-        socket.setSoTimeout(3000);
-        return socket;
+        try {
+            socket.connect(new InetSocketAddress("127.0.0.1", port), 2000);
+            socket.setSoTimeout(3000);
+            return socket;
+        } catch (IOException failure) {
+            try {
+                socket.close();
+            } catch (IOException cleanupFailure) {
+                failure.addSuppressed(cleanupFailure);
+            }
+            throw failure;
+        }
+    }
+
+    private static void assertPortReleased(int port) {
+        await().atMost(Duration.ofSeconds(5)).ignoreException(BindException.class).untilAsserted(() -> {
+            assertThrows(ConnectException.class, () -> {
+                try (Socket socket = connect(port)) {
+                    assertEquals(port, socket.getPort());
+                }
+            });
+            try (ServerSocket reservation = new ServerSocket()) {
+                reservation.setReuseAddress(true);
+                reservation.bind(new InetSocketAddress("0.0.0.0", port));
+                assertEquals(port, reservation.getLocalPort());
+            }
+        });
     }
 
     private static void assertEcho(Socket socket, byte[] payload) throws IOException {
