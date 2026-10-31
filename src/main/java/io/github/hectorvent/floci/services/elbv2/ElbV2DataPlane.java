@@ -91,6 +91,7 @@ public class ElbV2DataPlane {
     );
     private static final String PRESERVE_HOST_HEADER_ATTRIBUTE = "routing.http.preserve_host_header.enabled";
     private static final String IDLE_TIMEOUT_ATTRIBUTE = "idle_timeout.timeout_seconds";
+    private static final String TCP_IDLE_TIMEOUT_ATTRIBUTE = "tcp.idle_timeout.seconds";
     private static final long DEFAULT_IDLE_TIMEOUT_SECONDS = 60;
     private static final int MAX_LAMBDA_BODY_BYTES = 1024 * 1024;
     private static final int TCP_IDLE_TIMEOUT_SECONDS = 350;
@@ -219,7 +220,6 @@ public class ElbV2DataPlane {
                 .setConnectTimeout(5000)
                 .setKeepAlive(true));
         tcpClient = vertx.createNetClient(new NetClientOptions().setConnectTimeout(5000)
-                .setIdleTimeout(TCP_IDLE_TIMEOUT_SECONDS)
                 .setTcpKeepAlive(true));
     }
 
@@ -355,10 +355,17 @@ public class ElbV2DataPlane {
             ruleChains.put(arn, new AtomicReference<>(compiled.get()));
         }
         listenerRegions.put(arn, region);
+        if (conflictsWithServedListener(prepared.port(), prepared.tcp(), arn)) {
+            LOG.warnv("ELBv2 listener {0} on port {1} is registered but serves no traffic: a TCP listener "
+                    + "needs a dedicated local port and another listener already serves it. It takes over "
+                    + "the port once the serving listener is deleted or moved.", arn, String.valueOf(prepared.port()));
+            return true;
+        }
         Map<String, String> peers = listenersByHostAndPort.computeIfAbsent(
                 prepared.port(), ignored -> new ConcurrentHashMap<>());
         warnOnSharedPort(prepared, peers);
         addHostBindings(arn, prepared);
+        promoteParkedListeners(prepared.port());
         if (expected != null && expected.port() == prepared.port()
                 && (expected.secure() != prepared.secure() || expected.tcp() != prepared.tcp())) {
             restartPortServer(prepared.port());
@@ -384,7 +391,9 @@ public class ElbV2DataPlane {
     private void removePortBinding(String listenerArn, ListenerBinding binding) {
         removeHostBindings(listenerArn, binding);
         Map<String, String> listenersByHost = listenersByHostAndPort.get(binding.port());
-        if (listenersByHost == null || listenersByHost.isEmpty()) {
+        if ((listenersByHost == null || listenersByHost.isEmpty()) && promoteParkedListeners(binding.port())) {
+            restartPortServer(binding.port());
+        } else if (listenersByHost == null || listenersByHost.isEmpty()) {
             closePortServerIfUnused(binding.port(), listenersByHost);
         } else if (binding.secure()) {
             HttpServer server = servers.get(binding.port());
@@ -441,6 +450,53 @@ public class ElbV2DataPlane {
         return tlsProxyServer.reservesPort(port);
     }
 
+    /** Bindings of the listeners that actually serve a port, excluding parked ones. */
+    private Stream<ListenerBinding> servedBindings(int port) {
+        Map<String, String> served = listenersByHostAndPort.getOrDefault(port, Map.of());
+        return served.values().stream()
+                .map(listenerBindings::get)
+                .filter(binding -> binding != null && binding.port() == port);
+    }
+
+    /**
+     * A TCP listener owns its local port outright, so it cannot share it with any other listener.
+     * Only listeners that serve the port count: a parked one must not keep a newcomer off it.
+     */
+    private boolean conflictsWithServedListener(int port, boolean tcp, String listenerArn) {
+        Map<String, String> served = listenersByHostAndPort.getOrDefault(port, Map.of());
+        for (String otherArn : served.values()) {
+            ListenerBinding other = listenerBindings.get(otherArn);
+            if (!otherArn.equals(listenerArn) && other != null && other.port() == port && (other.tcp() || tcp)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Lets parked listeners serve a port that no longer conflicts with them, in ARN order so the
+     * outcome does not depend on map iteration. Returns whether any listener was promoted.
+     */
+    private boolean promoteParkedListeners(int port) {
+        Set<String> served = Set.copyOf(listenersByHostAndPort.getOrDefault(port, Map.of()).values());
+        List<String> parked = listenerBindings.entrySet().stream()
+                .filter(entry -> entry.getValue().port() == port && !served.contains(entry.getKey())
+                        && ruleChains.containsKey(entry.getKey()) && listenerRegions.containsKey(entry.getKey()))
+                .map(Map.Entry::getKey)
+                .sorted()
+                .toList();
+        boolean promoted = false;
+        for (String parkedArn : parked) {
+            ListenerBinding binding = listenerBindings.get(parkedArn);
+            if (binding != null && !conflictsWithServedListener(port, binding.tcp(), parkedArn)) {
+                addHostBindings(parkedArn, binding);
+                LOG.infov("ELBv2 listener {0} now serves port {1}", parkedArn, String.valueOf(port));
+                promoted = true;
+            }
+        }
+        return promoted;
+    }
+
     /**
      * Binds any registered listener whose port the proxy has just released. Yielding a port whose
      * bind had not resolved yet is the safe default, but if that bind then fails nothing else
@@ -494,7 +550,7 @@ public class ElbV2DataPlane {
                     + "registered but serves no traffic. {1}", String.valueOf(port), remedy);
             return;
         }
-        if (listenerBindings.values().stream().anyMatch(binding -> binding.port() == port && binding.tcp())) {
+        if (servedBindings(port).anyMatch(ListenerBinding::tcp)) {
             startTcpServer(port, state);
             return;
         }
@@ -541,7 +597,7 @@ public class ElbV2DataPlane {
 
     private void startTcpServer(int port, PortState state) {
         NetServer server = vertx.createNetServer(new NetServerOptions()
-                .setHost("0.0.0.0").setPort(port).setIdleTimeout(TCP_IDLE_TIMEOUT_SECONDS).setTcpKeepAlive(true));
+                .setHost("0.0.0.0").setPort(port).setTcpKeepAlive(true));
         long generation = ++state.generation;
         tcpServers.put(port, server);
         try {
@@ -606,7 +662,8 @@ public class ElbV2DataPlane {
                         upstream.close();
                         return;
                     }
-                    tunnel(socket, upstream, TCP_IDLE_TIMEOUT_SECONDS * 1000L);
+                    long idleTimeoutMillis = tcpIdleTimeoutMillis(listener.arn(), listener.region());
+                    tunnel(socket, upstream, idleTimeoutMillis);
                     socket.resume();
                 })
                 .onFailure(err -> {
@@ -732,13 +789,8 @@ public class ElbV2DataPlane {
     private void requireCompatiblePort(int port, boolean secure, boolean tcp, String listenerArn) {
         for (Map.Entry<String, ListenerBinding> entry : listenerBindings.entrySet()) {
             ListenerBinding existing = entry.getValue();
-            if (!entry.getKey().equals(listenerArn)
-                    && existing.port() == port
-                    && (existing.tcp() || tcp)) {
-                throw new IncompatibleListenerProtocolException(
-                        "ELBv2 TCP listeners require a dedicated local port; port " + port + " is already in use");
-            }
-            if (!entry.getKey().equals(listenerArn) && existing.port() == port && existing.secure() != secure) {
+            if (!entry.getKey().equals(listenerArn) && existing.port() == port && existing.secure() != secure
+                    && !existing.tcp() && !tcp) {
                 throw new IncompatibleListenerProtocolException(port);
             }
         }
@@ -817,11 +869,7 @@ public class ElbV2DataPlane {
 
     private PemKeyCertOptions tlsKeyCertOptions(int port) {
         Map<String, CertificateMaterial> certificates = new LinkedHashMap<>();
-        for (Map.Entry<String, ListenerBinding> entry : listenerBindings.entrySet()) {
-            ListenerBinding binding = entry.getValue();
-            if (binding.port() != port || !binding.secure()) {
-                continue;
-            }
+        for (ListenerBinding binding : servedBindings(port).filter(ListenerBinding::secure).toList()) {
             for (CertificateMaterial certificate : binding.certificates()) {
                 certificates.putIfAbsent(certificate.arn(), certificate);
             }
@@ -843,8 +891,7 @@ public class ElbV2DataPlane {
     }
 
     private boolean portIsSecure(int port) {
-        return listenerBindings.values().stream()
-                .filter(binding -> binding.port() == port)
+        return servedBindings(port)
                 .findFirst()
                 .map(ListenerBinding::secure)
                 .orElse(false);
@@ -1059,6 +1106,27 @@ public class ElbV2DataPlane {
             }
         }
         return Math.max(1, seconds) * 1000;
+    }
+
+    private String listenerAttribute(String listenerArn, String region, String key) {
+        Listener listener = elbV2Service.getListener(region, listenerArn);
+        if (listener == null || listener.getAttributes() == null) {
+            return null;
+        }
+        return listener.getAttributes().get(key);
+    }
+
+    private long tcpIdleTimeoutMillis(String listenerArn, String region) {
+        String configured = listenerAttribute(listenerArn, region, TCP_IDLE_TIMEOUT_ATTRIBUTE);
+        long seconds = TCP_IDLE_TIMEOUT_SECONDS;
+        if (configured != null) {
+            try {
+                seconds = Long.parseLong(configured.trim());
+            } catch (NumberFormatException e) {
+                LOG.debugv("Ignoring non-numeric {0} value {1}", TCP_IDLE_TIMEOUT_ATTRIBUTE, configured);
+            }
+        }
+        return Math.max(1, seconds) * 1000L;
     }
 
     /** Healthy targets, falling back to all registered ones; null when none are registered at all. */
@@ -1466,7 +1534,8 @@ public class ElbV2DataPlane {
 
     /**
      * Relays bytes both ways until either side closes or no data crosses the tunnel in either
-     * direction for the load balancer's {@code idle_timeout.timeout_seconds}, as an ALB does.
+     * direction for the configured idle timeout (an ALB load balancer's
+     * {@code idle_timeout.timeout_seconds} or an NLB listener's {@code tcp.idle_timeout.seconds}).
      */
     private void tunnel(NetSocket client, NetSocket target, long idleTimeoutMillis) {
         AtomicLong lastActivity = new AtomicLong(System.nanoTime());

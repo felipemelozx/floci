@@ -29,8 +29,10 @@ import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.services.elasticloadbalancingv2.ElasticLoadBalancingV2Client;
 import software.amazon.awssdk.services.elasticloadbalancingv2.model.Action;
 import software.amazon.awssdk.services.elasticloadbalancingv2.model.ActionTypeEnum;
-import software.amazon.awssdk.services.elasticloadbalancingv2.model.ElasticLoadBalancingV2Exception;
 import software.amazon.awssdk.services.elasticloadbalancingv2.model.FixedResponseActionConfig;
+import software.amazon.awssdk.services.elasticloadbalancingv2.model.Listener;
+import software.amazon.awssdk.services.elasticloadbalancingv2.model.ListenerAttribute;
+import software.amazon.awssdk.services.elasticloadbalancingv2.model.LoadBalancer;
 import software.amazon.awssdk.services.elasticloadbalancingv2.model.LoadBalancerTypeEnum;
 import software.amazon.awssdk.services.elasticloadbalancingv2.model.ProtocolEnum;
 import software.amazon.awssdk.services.elasticloadbalancingv2.model.TargetDescription;
@@ -48,6 +50,7 @@ import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.URI;
+import java.nio.charset.StandardCharsets;
 import java.security.KeyStore;
 import java.time.Duration;
 import java.util.HashSet;
@@ -60,6 +63,7 @@ import static org.junit.jupiter.api.Assertions.assertAll;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 @QuarkusTest
 @TestProfile(RealElbV2DataPlaneProfile.class)
@@ -270,7 +274,7 @@ class ElbV2TcpDataPlaneIntegrationTest {
 
     @ParameterizedTest
     @EnumSource(value = ProtocolEnum.class, names = {"TCP", "HTTP"})
-    void tcpListenerCannotShareItsLocalPort(ProtocolEnum protocol) throws Exception {
+    void secondListenerOnTcpPortRegistersWithoutTakingThePort(ProtocolEnum protocol) throws Exception {
         String otherLbArn = client.createLoadBalancer(request -> request.name("tcp-regression-other")
                 .type(protocol == ProtocolEnum.TCP ? LoadBalancerTypeEnum.NETWORK : LoadBalancerTypeEnum.APPLICATION)
                 .subnets(Ec2Service.defaultSubnetId("us-east-1", "a"),
@@ -281,15 +285,54 @@ class ElbV2TcpDataPlaneIntegrationTest {
                     ? Action.builder().type(ActionTypeEnum.FORWARD).targetGroupArn(targetGroupArn).build()
                     : Action.builder().type(ActionTypeEnum.FIXED_RESPONSE).fixedResponseConfig(
                             FixedResponseActionConfig.builder().statusCode("200").contentType("text/plain").build()).build();
-            ElasticLoadBalancingV2Exception failure = assertThrows(ElasticLoadBalancingV2Exception.class,
-                    () -> client.createListener(request -> request.loadBalancerArn(otherLbArn)
-                            .protocol(protocol).port(listenerPort).defaultActions(action)));
-            assertEquals("InvalidConfigurationRequest", failure.awsErrorDetails().errorCode());
+            Listener created = client.createListener(request -> request.loadBalancerArn(otherLbArn)
+                    .protocol(protocol).port(listenerPort).defaultActions(action))
+                    .listeners().getFirst();
+            assertEquals(otherLbArn, created.loadBalancerArn());
+            List<Listener> described = client.describeListeners(request -> request.loadBalancerArn(otherLbArn)).listeners();
+            assertEquals(1, described.size());
+            assertEquals(created.listenerArn(), described.getFirst().listenerArn());
             try (Socket socket = connect(listenerPort)) {
                 assertEcho(socket, new byte[]{0, 8, 13, 10});
             }
         } finally {
             client.deleteLoadBalancer(request -> request.loadBalancerArn(otherLbArn));
+        }
+    }
+
+    @Test
+    void parkedListenerServesThePortOnceTheTcpListenerIsDeleted() throws Exception {
+        LoadBalancer other = client.createLoadBalancer(
+                request -> request.name("tcp-regression-parked")
+                        .type(LoadBalancerTypeEnum.APPLICATION)
+                        .subnets(Ec2Service.defaultSubnetId("us-east-1", "a"),
+                                Ec2Service.defaultSubnetId("us-east-1", "b")))
+                .loadBalancers().getFirst();
+        try {
+            client.createListener(request -> request.loadBalancerArn(other.loadBalancerArn())
+                    .protocol(ProtocolEnum.HTTP).port(listenerPort)
+                    .defaultActions(Action.builder().type(ActionTypeEnum.FIXED_RESPONSE).fixedResponseConfig(
+                            FixedResponseActionConfig.builder().statusCode("200").contentType("text/plain")
+                                    .messageBody("parked").build()).build()));
+            try (Socket socket = connect(listenerPort)) {
+                assertEcho(socket, new byte[]{0, 9, 13, 10});
+            }
+
+            client.deleteListener(request -> request.listenerArn(listenerArn));
+            listenerArn = null;
+
+            await().atMost(Duration.ofSeconds(5)).ignoreExceptions().untilAsserted(() -> {
+                try (Socket socket = connect(listenerPort)) {
+                    socket.setSoTimeout(2000);
+                    socket.getOutputStream().write(("GET / HTTP/1.1\r\nHost: " + other.dnsName()
+                            + "\r\nConnection: close\r\n\r\n").getBytes(StandardCharsets.US_ASCII));
+                    String response = new String(socket.getInputStream().readAllBytes(), StandardCharsets.US_ASCII);
+                    assertTrue(response.startsWith("HTTP/1.1 200"), response);
+                    assertTrue(response.endsWith("parked"), response);
+                }
+            });
+        } finally {
+            client.deleteLoadBalancer(request -> request.loadBalancerArn(other.loadBalancerArn()));
         }
     }
 
@@ -350,6 +393,24 @@ class ElbV2TcpDataPlaneIntegrationTest {
                     () -> client.modifyListener(request -> request.listenerArn(listenerArn).defaultActions(Action.builder()
                             .type(ActionTypeEnum.FORWARD).targetGroupArn(targetGroupArn).build())),
                     () -> client.deleteTargetGroup(request -> request.targetGroupArn(emptyTgArn)));
+        }
+    }
+
+    @Test
+    void idleTimeoutClosesTcpConnectionAfterConfiguredDuration() throws Exception {
+        client.modifyListenerAttributes(request -> request.listenerArn(listenerArn)
+                .attributes(ListenerAttribute.builder().key("tcp.idle_timeout.seconds").value("1").build()));
+        try {
+            try (Socket socket = connect(listenerPort)) {
+                assertEcho(socket, new byte[]{1, 2, 3});
+                await().atMost(Duration.ofSeconds(5)).untilAsserted(() -> {
+                    assertEquals(-1, socket.getInputStream().read(),
+                            "Connection must be closed after idle timeout");
+                });
+            }
+        } finally {
+            client.modifyListenerAttributes(request -> request.listenerArn(listenerArn)
+                    .attributes(ListenerAttribute.builder().key("tcp.idle_timeout.seconds").value("350").build()));
         }
     }
 
