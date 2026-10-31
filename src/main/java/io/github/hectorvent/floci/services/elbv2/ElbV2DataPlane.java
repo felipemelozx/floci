@@ -588,18 +588,12 @@ public class ElbV2DataPlane {
             socket.close();
             return;
         }
-        List<TargetDescription> targets = tg.getTargets();
-        List<TargetDescription> healthy = targets.stream()
-                .filter(target -> healthChecker.isHealthy(tgArn, target, ElbV2HealthChecker.effectivePort(target, tg)))
-                .toList();
-        List<TargetDescription> candidates = healthy.isEmpty() ? targets : healthy;
-        if (candidates.isEmpty()) {
+        List<TargetDescription> candidates = targetCandidates(tgArn, tg);
+        if (candidates == null) {
             socket.close();
             return;
         }
-        int index = Math.floorMod(rrCounters.computeIfAbsent(tgArn, ignored -> new AtomicInteger())
-                .getAndIncrement(), candidates.size());
-        TargetDescription target = candidates.get(index);
+        TargetDescription target = pickRoundRobin(tgArn, candidates);
         int port = ElbV2HealthChecker.effectivePort(target, tg);
         String host = ElbV2TargetResolver.resolveHost(ec2Service, tg, target);
         AtomicBoolean disconnected = new AtomicBoolean();
@@ -1018,12 +1012,8 @@ public class ElbV2DataPlane {
             return;
         }
 
-        List<TargetDescription> allTargets = tg.getTargets();
-        List<TargetDescription> healthy = allTargets.stream()
-                .filter(t -> healthChecker.isHealthy(tgArn, t, ElbV2HealthChecker.effectivePort(t, tg)))
-                .collect(Collectors.toList());
-        List<TargetDescription> candidates = healthy.isEmpty() ? allTargets : healthy;
-        if (candidates.isEmpty()) {
+        List<TargetDescription> candidates = targetCandidates(tgArn, tg);
+        if (candidates == null) {
             req.response().setStatusCode(503).end("No targets available");
             return;
         }
@@ -1032,9 +1022,7 @@ public class ElbV2DataPlane {
         String scope = binding != null ? binding.loadBalancerArn() + "\n" + tgArn : "";
         TargetDescription target = stickyCookie.target(req.headers().getAll("Cookie"), scope, tg, candidates, duration);
         if (target == null) {
-            AtomicInteger counter = rrCounters.computeIfAbsent(tgArn, k -> new AtomicInteger(0));
-            int idx = Math.abs(counter.getAndIncrement() % candidates.size());
-            target = candidates.get(idx);
+            target = pickRoundRobin(tgArn, candidates);
         }
         List<String> cookies = duration > 0 ? stickyCookie.headers(scope, tg, target) : List.of();
         int targetPort = ElbV2HealthChecker.effectivePort(target, tg);
@@ -1071,6 +1059,23 @@ public class ElbV2DataPlane {
             }
         }
         return Math.max(1, seconds) * 1000;
+    }
+
+    /** Healthy targets, falling back to all registered ones; null when none are registered at all. */
+    private List<TargetDescription> targetCandidates(String tgArn, TargetGroup tg) {
+        List<TargetDescription> all = tg.getTargets();
+        List<TargetDescription> healthy = all.stream()
+                .filter(t -> healthChecker.isHealthy(tgArn, t, ElbV2HealthChecker.effectivePort(t, tg)))
+                .toList();
+        List<TargetDescription> candidates = healthy.isEmpty() ? all : healthy;
+        return candidates.isEmpty() ? null : candidates;
+    }
+
+    private TargetDescription pickRoundRobin(String tgArn, List<TargetDescription> candidates) {
+        int index = Math.floorMod(
+                rrCounters.computeIfAbsent(tgArn, ignored -> new AtomicInteger()).getAndIncrement(),
+                candidates.size());
+        return candidates.get(index);
     }
 
     private void invokeLambdaTarget(HttpServerRequest req, String functionArn, String region) {
