@@ -203,6 +203,10 @@ public class ResourceArnBuilder {
             case "dsql"           -> List.of(buildDsqlArn(path, ctx, region, accountId, partition));
             case "eks"            -> List.of(buildEksArn(path, ctx, region, accountId));
             case "apigateway"     -> List.of(buildApiGatewayArn(ctx, region, partition));
+            case "route53"        -> "route53:GetReusableDelegationSet".equals(operation)
+                    || "route53:DeleteReusableDelegationSet".equals(operation)
+                    ? List.of(buildRoute53DelegationSetArn(ctx, partition))
+                    : namedResources(credentialScope, operation, ctx, region, accountId, partition);
             default               -> namedResources(credentialScope, operation, ctx, region, accountId, partition);
         };
     }
@@ -231,6 +235,17 @@ public class ResourceArnBuilder {
             }
         }
         return null;
+    }
+
+    private String buildRoute53DelegationSetArn(ContainerRequestContext ctx, String partition) {
+        String id = ctx.getUriInfo().getPathParameters().getFirst("Id");
+        if (id == null) {
+            return "*";
+        }
+        if (id.startsWith("/delegationset/")) {
+            id = id.substring(15);
+        }
+        return AwsArnUtils.Arn.global(partition, "route53", "", "delegationset/" + id).toString();
     }
 
     private String buildResourceGroupArn(ContainerRequestContext ctx, String region, String accountId) {
@@ -1120,16 +1135,12 @@ public class ResourceArnBuilder {
      * refused, so it is checked as written.
      */
     private static String lambdaTaggedArn(String tagged, String accountId) {
-        if (LambdaMicrovmsService.ownsArn(tagged)) {
-            // Read as LambdaTagController and LambdaMicrovmsService read it: the Region is the fourth field,
-            // the name what follows the last colon.
-            String[] fields = tagged.split(":");
-            String region = fields.length > 3 ? fields[3] : "";
-            String type = tagged.contains(":microvm-image:") ? "microvm-image:"
-                    : tagged.contains(":network-connector:") ? "network-connector:" : null;
-            if (type != null && !region.isBlank()) {
-                return AwsArnUtils.Arn.of("lambda", region, accountId,
-                        type + tagged.substring(tagged.lastIndexOf(':') + 1)).toString();
+        // The image or connector LambdaMicrovmsService tags: the caller's own, in the ARN's Region.
+        Optional<String> microvmResource = LambdaMicrovmsService.taggedResource(tagged);
+        if (microvmResource.isPresent()) {
+            String region = AwsArnUtils.parse(tagged).region();
+            if (!region.isBlank()) {
+                return AwsArnUtils.Arn.of("lambda", region, accountId, microvmResource.get()).toString();
             }
         }
         if (!AwsArnUtils.looksLikeArn(tagged)) {

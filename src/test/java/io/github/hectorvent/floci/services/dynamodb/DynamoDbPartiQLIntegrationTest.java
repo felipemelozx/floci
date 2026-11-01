@@ -8,6 +8,8 @@ import org.junit.jupiter.api.MethodOrderer;
 import org.junit.jupiter.api.Order;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestMethodOrder;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
@@ -529,6 +531,97 @@ class DynamoDbPartiQLIntegrationTest {
             .statusCode(400)
             .body("message", equalTo("2 validation errors detected: " + badCapacity
                     + "; Value null at 'statements' failed to satisfy constraint: Member must not be null"));
+    }
+
+    @Test
+    @Order(26)
+    void aTableAliasIsRefusedBeforeTheTableIsRead() {
+        String missing = TABLE + "-never-created";
+
+        statement("SELECT * FROM \"" + missing + "\" AS t WHERE pk = 1e126")
+            .statusCode(400)
+            .body("__type", equalTo("ValidationException"))
+            .body("message", equalTo("Aliasing is not supported"));
+        request("DynamoDB_20120810.ExecuteTransaction", """
+                {"TransactStatements":[{"Statement":"SELECT * FROM \\"%1$s\\" WHERE pk = 'a'"},
+                 {"Statement":"SELECT * FROM \\"%1$s\\" t WHERE pk = 'b'"}]}
+                """.formatted(TABLE))
+            .statusCode(400)
+            .body("message", equalTo("Validation failed in TransactStatements[1]: Aliasing is not supported"));
+        request("DynamoDB_20120810.BatchExecuteStatement", """
+                {"Statements":[{"Statement":"UPDATE \\"%1$s\\" t SET a = 1 WHERE pk = 'a'"},
+                 {"Statement":"INSERT INTO \\"%1$s\\" t VALUE {'pk': 'a'}"}]}
+                """.formatted(missing))
+            .statusCode(200)
+            .body("Responses[0].Error.Message", equalTo("Aliasing is not supported"))
+            .body("Responses[1].Error.Message",
+                    equalTo("Statement wasn't well formed, can't be processed: Unexpected token after expression"));
+    }
+
+    @Test
+    @Order(27)
+    void aStatementThatIsOneTermIsRefusedByItsKind() {
+        statement("x IS INT4")
+            .statusCode(400)
+            .body("__type", equalTo("ValidationException"))
+            .body("message", equalTo("Unsupported operation: IsType"));
+        request("DynamoDB_20120810.ExecuteTransaction", """
+                {"TransactStatements":[{"Statement":"?"}]}
+                """)
+            .statusCode(400)
+            .body("message", equalTo("Validation failed in TransactStatements[0]: Unsupported operation: Parameter"));
+        request("DynamoDB_20120810.BatchExecuteStatement", """
+                {"Statements":[{"Statement":"x.y IS DOUBLE PRECISION"}]}
+                """)
+            .statusCode(200)
+            .body("Responses[0].Error.Code", equalTo("ValidationError"))
+            .body("Responses[0].Error.Message", equalTo("Unsupported operation: IsType"));
+    }
+
+    @Test
+    @Order(28)
+    void aStatementTheLexerCannotReadIsRefusedWithNothingAfterTheColon() {
+        String notWellFormed = "Statement wasn't well formed, can't be processed: ";
+
+        statement("SELECT * FROM \"" + TABLE + "\" WHERE pk = 'x' # note")
+            .statusCode(400)
+            .body("__type", equalTo("ValidationException"))
+            .body("message", equalTo(notWellFormed));
+        request("DynamoDB_20120810.ExecuteTransaction", """
+                {"TransactStatements":[{"Statement":"UPDATE \\"%1$s\\" SET a = 1 WHERE pk = 'x'"},
+                 {"Statement":"UPDATE \\"%1$s\\" SET a = 1 WHERE pk = 'y"}]}
+                """.formatted(TABLE))
+            .statusCode(400)
+            .body("message", equalTo("Validation failed in TransactStatements[1]: " + notWellFormed));
+        request("DynamoDB_20120810.BatchExecuteStatement", """
+                {"Statements":[{"Statement":"SELECT * FROM \\"%s\\" WHERE pk = 'x' ~"}]}
+                """.formatted(TABLE))
+            .statusCode(200)
+            .body("Responses[0].Error.Code", equalTo("ValidationError"))
+            .body("Responses[0].Error.Message", equalTo(notWellFormed));
+    }
+
+    @ParameterizedTest
+    @Order(29)
+    @ValueSource(strings = {
+            "SELECT * FROM \"%s\" WHERE pk = 'x'",
+            "SELECT * FROM \"%s\".\"gsi\" WHERE pk = 'x'",
+            "INSERT INTO \"%s\" VALUE {'pk': 'x'}",
+            "UPDATE \"%s\" SET a = 1 WHERE pk = 'x'",
+            "DELETE FROM \"%s\" WHERE pk = 'x'",
+            "FROM \"%s\" WHERE pk = 'x' SET c = 1"})
+    void aStatementOnAMissingTableIsRefusedWithoutTheTableName(String statement) {
+        String partiql = statement.formatted(TABLE + "-never-created");
+
+        statement(partiql)
+            .statusCode(400)
+            .body("__type", equalTo("ResourceNotFoundException"))
+            .body("message", equalTo("Requested resource not found"));
+        request("DynamoDB_20120810.BatchExecuteStatement",
+                "{\"Statements\":[{\"Statement\":\"" + partiql.replace("\"", "\\\"") + "\"}]}")
+            .statusCode(200)
+            .body("Responses[0].Error.Code", equalTo("ResourceNotFound"))
+            .body("Responses[0].Error.Message", equalTo("Requested resource not found"));
     }
 
     private static void putItem(String pk, String attributes) {

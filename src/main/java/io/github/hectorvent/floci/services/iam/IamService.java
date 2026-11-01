@@ -176,6 +176,13 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
      */
     private final Object tagLock = new Object();
 
+    /**
+     * Guards the read-modify-write of a customer managed policy's AttachmentCount. Attaching or
+     * detaching one policy on several principals at once would otherwise lose updates, leaving a
+     * fully detached policy that DeletePolicy still refuses as attached.
+     */
+    private final Object policyAttachmentCountLock = new Object();
+
     /** CSPRNG for long-term secret access keys; ordinary resource IDs keep using {@link ThreadLocalRandom}. */
     private final SecureRandom secureRandom = new SecureRandom();
 
@@ -1708,21 +1715,23 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
     }
 
     private void incrementCustomerManagedPolicyAttachmentCount(IamPolicy policy) {
-        if (AwsManagedPolicies.isManagedPolicyArn(policy.getArn())) {
-            return;
-        }
-        policy.setAttachmentCount(policy.getAttachmentCount() + 1);
-        policies.put(policy.getArn(), policy);
+        adjustCustomerManagedPolicyAttachmentCount(policy.getArn(), 1);
     }
 
     private void decrementCustomerManagedPolicyAttachmentCount(String policyArn) {
+        adjustCustomerManagedPolicyAttachmentCount(policyArn, -1);
+    }
+
+    private void adjustCustomerManagedPolicyAttachmentCount(String policyArn, int delta) {
         if (AwsManagedPolicies.isManagedPolicyArn(policyArn)) {
             return;
         }
-        policies.get(policyArn).ifPresent(policy -> {
-            policy.setAttachmentCount(Math.max(0, policy.getAttachmentCount() - 1));
-            policies.put(policyArn, policy);
-        });
+        synchronized (policyAttachmentCountLock) {
+            policies.get(policyArn).ifPresent(policy -> {
+                policy.setAttachmentCount(Math.max(0, policy.getAttachmentCount() + delta));
+                policies.put(policyArn, policy);
+            });
+        }
     }
 
     private void rejectIfAwsManaged(String policyArn) {
@@ -4477,6 +4486,17 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
         return findSessionAnyAccount(accessKeyId)
                 .filter(session -> isExpired(session, clock.instant()))
                 .filter(session -> hasMatchingSessionToken(session, sessionToken))
+                .isPresent();
+    }
+
+    /** Role chaining requires a live role credential with this request's matching issued token. */
+    public boolean isRoleSession(String accessKeyId, String sessionToken) {
+        return currentSession(accessKeyId)
+                .filter(session -> hasMatchingSessionToken(session, sessionToken))
+                .map(SessionCredential::getRoleArn)
+                .filter(AwsArnUtils::isArn)
+                .map(AwsArnUtils::parse)
+                .filter(arn -> "iam".equals(arn.service()) && arn.resource().startsWith("role/"))
                 .isPresent();
     }
 
