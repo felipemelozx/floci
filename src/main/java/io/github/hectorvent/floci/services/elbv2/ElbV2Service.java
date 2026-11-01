@@ -706,8 +706,32 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
 
     public void modifyListenerAttributes(String region, String arn, Map<String, String> newAttrs) {
         Listener listener = requireListener(region, arn);
+        validateListenerAttributes(newAttrs);
         listener.getAttributes().putAll(newAttrs);
         persistRegion(listeners, region);
+    }
+
+    private void validateListenerAttributes(Map<String, String> newAttrs) {
+        if (newAttrs == null) {
+            return;
+        }
+        for (Map.Entry<String, String> entry : newAttrs.entrySet()) {
+            if (ElbV2DataPlane.TCP_IDLE_TIMEOUT_ATTRIBUTE.equals(entry.getKey())) {
+                String value = entry.getValue();
+                long seconds;
+                try {
+                    seconds = Long.parseLong(value != null ? value.trim() : "");
+                } catch (NumberFormatException e) {
+                    throw new AwsException("InvalidConfigurationRequest",
+                            "The attribute 'tcp.idle_timeout.seconds' must be between 60 and 6000", 400);
+                }
+                if (seconds < ElbV2DataPlane.MIN_TCP_IDLE_TIMEOUT_SECONDS
+                        || seconds > ElbV2DataPlane.MAX_TCP_IDLE_TIMEOUT_SECONDS) {
+                    throw new AwsException("InvalidConfigurationRequest",
+                            "The attribute 'tcp.idle_timeout.seconds' must be between 60 and 6000", 400);
+                }
+            }
+        }
     }
 
     public void deleteListener(String region, String listenerArn) {

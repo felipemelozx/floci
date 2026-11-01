@@ -30,6 +30,7 @@ import software.amazon.awssdk.services.elasticloadbalancingv2.ElasticLoadBalanci
 import software.amazon.awssdk.services.elasticloadbalancingv2.model.Action;
 import software.amazon.awssdk.services.elasticloadbalancingv2.model.ActionTypeEnum;
 import software.amazon.awssdk.services.elasticloadbalancingv2.model.FixedResponseActionConfig;
+import software.amazon.awssdk.services.elasticloadbalancingv2.model.InvalidConfigurationRequestException;
 import software.amazon.awssdk.services.elasticloadbalancingv2.model.Listener;
 import software.amazon.awssdk.services.elasticloadbalancingv2.model.ListenerAttribute;
 import software.amazon.awssdk.services.elasticloadbalancingv2.model.LoadBalancer;
@@ -71,6 +72,9 @@ class ElbV2TcpDataPlaneIntegrationTest {
 
     @Inject
     Vertx vertx;
+
+    @Inject
+    ElbV2DataPlane dataPlane;
 
     @TestHTTPResource
     URI endpoint;
@@ -397,21 +401,30 @@ class ElbV2TcpDataPlaneIntegrationTest {
     }
 
     @Test
-    void idleTimeoutClosesTcpConnectionAfterConfiguredDuration() throws Exception {
+    void rejectsOutOfRangeTcpIdleTimeout() {
+        InvalidConfigurationRequestException tooLow = assertThrows(InvalidConfigurationRequestException.class,
+                () -> client.modifyListenerAttributes(request -> request.listenerArn(listenerArn)
+                        .attributes(ListenerAttribute.builder().key("tcp.idle_timeout.seconds").value("1").build())));
+        assertEquals("InvalidConfigurationRequest", tooLow.awsErrorDetails().errorCode());
+
+        InvalidConfigurationRequestException tooHigh = assertThrows(InvalidConfigurationRequestException.class,
+                () -> client.modifyListenerAttributes(request -> request.listenerArn(listenerArn)
+                        .attributes(ListenerAttribute.builder().key("tcp.idle_timeout.seconds").value("6001").build())));
+        assertEquals("InvalidConfigurationRequest", tooHigh.awsErrorDetails().errorCode());
+
+        InvalidConfigurationRequestException nonNumeric = assertThrows(InvalidConfigurationRequestException.class,
+                () -> client.modifyListenerAttributes(request -> request.listenerArn(listenerArn)
+                        .attributes(ListenerAttribute.builder().key("tcp.idle_timeout.seconds").value("not-a-number").build())));
+        assertEquals("InvalidConfigurationRequest", nonNumeric.awsErrorDetails().errorCode());
+    }
+
+    @Test
+    void relayReadsConfiguredTcpIdleTimeout() {
+        assertEquals(350_000L, dataPlane.tcpIdleTimeoutMillis(listenerArn, "us-east-1"));
+
         client.modifyListenerAttributes(request -> request.listenerArn(listenerArn)
-                .attributes(ListenerAttribute.builder().key("tcp.idle_timeout.seconds").value("1").build()));
-        try {
-            try (Socket socket = connect(listenerPort)) {
-                assertEcho(socket, new byte[]{1, 2, 3});
-                await().atMost(Duration.ofSeconds(5)).untilAsserted(() -> {
-                    assertEquals(-1, socket.getInputStream().read(),
-                            "Connection must be closed after idle timeout");
-                });
-            }
-        } finally {
-            client.modifyListenerAttributes(request -> request.listenerArn(listenerArn)
-                    .attributes(ListenerAttribute.builder().key("tcp.idle_timeout.seconds").value("350").build()));
-        }
+                .attributes(ListenerAttribute.builder().key("tcp.idle_timeout.seconds").value("120").build()));
+        assertEquals(120_000L, dataPlane.tcpIdleTimeoutMillis(listenerArn, "us-east-1"));
     }
 
     private void replaceBackend(NetServerOptions options, Handler<NetSocket> handler) throws Exception {

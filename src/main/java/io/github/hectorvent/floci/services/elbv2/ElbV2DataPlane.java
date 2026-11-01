@@ -91,10 +91,12 @@ public class ElbV2DataPlane {
     );
     private static final String PRESERVE_HOST_HEADER_ATTRIBUTE = "routing.http.preserve_host_header.enabled";
     private static final String IDLE_TIMEOUT_ATTRIBUTE = "idle_timeout.timeout_seconds";
-    private static final String TCP_IDLE_TIMEOUT_ATTRIBUTE = "tcp.idle_timeout.seconds";
+    static final String TCP_IDLE_TIMEOUT_ATTRIBUTE = "tcp.idle_timeout.seconds";
     private static final long DEFAULT_IDLE_TIMEOUT_SECONDS = 60;
     private static final int MAX_LAMBDA_BODY_BYTES = 1024 * 1024;
-    private static final int TCP_IDLE_TIMEOUT_SECONDS = 350;
+    static final int TCP_IDLE_TIMEOUT_SECONDS = 350;
+    static final int MIN_TCP_IDLE_TIMEOUT_SECONDS = 60;
+    static final int MAX_TCP_IDLE_TIMEOUT_SECONDS = 6000;
 
     @Inject
     Vertx vertx;
@@ -1095,17 +1097,21 @@ public class ElbV2DataPlane {
         return loadBalancer.getAttributes().get(key);
     }
 
-    private long idleTimeoutMillis(String listenerArn, String region) {
-        String configured = loadBalancerAttribute(listenerArn, region, IDLE_TIMEOUT_ATTRIBUTE);
-        long seconds = DEFAULT_IDLE_TIMEOUT_SECONDS;
+    private long parseTimeoutMillis(String configured, String attributeKey, long defaultSeconds) {
+        long seconds = defaultSeconds;
         if (configured != null) {
             try {
                 seconds = Long.parseLong(configured.trim());
             } catch (NumberFormatException e) {
-                LOG.debugv("Ignoring non-numeric {0} value {1}", IDLE_TIMEOUT_ATTRIBUTE, configured);
+                LOG.debugv("Ignoring non-numeric {0} value {1}", attributeKey, configured);
             }
         }
-        return Math.max(1, seconds) * 1000;
+        return Math.max(1, seconds) * 1000L;
+    }
+
+    private long idleTimeoutMillis(String listenerArn, String region) {
+        return parseTimeoutMillis(loadBalancerAttribute(listenerArn, region, IDLE_TIMEOUT_ATTRIBUTE),
+                IDLE_TIMEOUT_ATTRIBUTE, DEFAULT_IDLE_TIMEOUT_SECONDS);
     }
 
     private String listenerAttribute(String listenerArn, String region, String key) {
@@ -1116,17 +1122,9 @@ public class ElbV2DataPlane {
         return listener.getAttributes().get(key);
     }
 
-    private long tcpIdleTimeoutMillis(String listenerArn, String region) {
-        String configured = listenerAttribute(listenerArn, region, TCP_IDLE_TIMEOUT_ATTRIBUTE);
-        long seconds = TCP_IDLE_TIMEOUT_SECONDS;
-        if (configured != null) {
-            try {
-                seconds = Long.parseLong(configured.trim());
-            } catch (NumberFormatException e) {
-                LOG.debugv("Ignoring non-numeric {0} value {1}", TCP_IDLE_TIMEOUT_ATTRIBUTE, configured);
-            }
-        }
-        return Math.max(1, seconds) * 1000L;
+    long tcpIdleTimeoutMillis(String listenerArn, String region) {
+        return parseTimeoutMillis(listenerAttribute(listenerArn, region, TCP_IDLE_TIMEOUT_ATTRIBUTE),
+                TCP_IDLE_TIMEOUT_ATTRIBUTE, TCP_IDLE_TIMEOUT_SECONDS);
     }
 
     /** Healthy targets, falling back to all registered ones; null when none are registered at all. */
